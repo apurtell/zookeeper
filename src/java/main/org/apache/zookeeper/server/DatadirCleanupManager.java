@@ -104,7 +104,9 @@ public class DatadirCleanupManager {
 
         timer = new Timer("PurgeTask", true);
         TimerTask task = new PurgeTask(dataLogDir, snapDir, snapRetainCount);
-        timer.scheduleAtFixedRate(task, 0, TimeUnit.HOURS.toMillis(purgeInterval));
+        // Delay the initial task execution to avoid startup races, see ZOOKEEPER-1936
+        timer.scheduleAtFixedRate(task, TimeUnit.MINUTES.toMillis(5),
+            TimeUnit.HOURS.toMillis(purgeInterval));
 
         purgeTaskStatus = PurgeTaskStatus.STARTED;
     }
