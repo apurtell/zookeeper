@@ -1,0 +1,14 @@
+/target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/crates/zk-ffi-layout/target/
+/crates/zk-jute/src/generated/
+# The TLS test material is made at test time into the zk-testkit cache.
+# These rules catch the output of a manual run of a generator in place.
+/c/tests/conformance/tls/corpus/
+/crates/zk-driver/tests/fixtures/tls/*
+!/crates/zk-driver/tests/fixtures/tls/gen.sh
+!/crates/zk-driver/tests/fixtures/tls/trust/
+/crates/zk-driver/tests/fixtures/tls/trust/*
+!/crates/zk-driver/tests/fixtures/tls/trust/gen.sh

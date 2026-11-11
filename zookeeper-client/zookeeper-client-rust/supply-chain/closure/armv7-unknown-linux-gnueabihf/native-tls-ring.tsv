@@ -1,0 +1,82 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The resolved crates of one shipped build. `cargo xtask closure update`
+# writes this file, and `cargo xtask closure check` compares it.
+# Do not edit it.
+#
+# package: apache-zookeeper
+# features: --features tls-ring
+# target: armv7-unknown-linux-gnueabihf
+
+name	version	source	kind
+aes	0.8.4	crates-io	target
+apache-zookeeper	workspace	path	target
+base64ct	1.8.3	crates-io	target
+bitflags	2.13.2	crates-io	target
+block-buffer	0.10.4	crates-io	target
+block-padding	0.3.3	crates-io	target
+bytes	1.12.1	crates-io	target
+cbc	0.1.2	crates-io	target
+cc	1.11.0	crates-io	host
+cfg-if	1.0.5	crates-io	target
+cipher	0.4.4	crates-io	target
+const-oid	0.9.6	crates-io	target
+crypto-common	0.1.7	crates-io	target
+der	0.7.10	crates-io	target
+des	0.8.1	crates-io	target
+digest	0.10.7	crates-io	target
+errno	0.3.14	crates-io	target
+find-msvc-tools	0.1.15	crates-io	host
+futures-core	0.3.34	crates-io	target
+generic-array	0.14.7	crates-io	target
+getrandom	0.2.17	crates-io	target
+hmac	0.12.1	crates-io	target
+inout	0.1.4	crates-io	target
+libc	0.2.191	crates-io	target
+linux-raw-sys	0.12.1	crates-io	target
+md-5	0.10.6	crates-io	target
+mio	1.2.4	crates-io	target
+once_cell	1.21.4	crates-io	target
+pbkdf2	0.12.2	crates-io	target
+pem-rfc7468	0.7.0	crates-io	target
+pin-project-lite	0.2.17	crates-io	target
+pkcs5	0.7.1	crates-io	target
+pkcs8	0.10.2	crates-io	target
+rand_core	0.6.4	crates-io	target
+ring	0.17.14	crates-io	target
+rustix	1.1.6	crates-io	target
+rustls	0.23.46	crates-io	target
+rustls-pki-types	1.15.1	crates-io	target
+rustls-webpki	0.103.16	crates-io	target
+salsa20	0.10.2	crates-io	target
+scrypt	0.11.0	crates-io	target
+sha1	0.10.7	crates-io	target
+sha2	0.10.9	crates-io	target
+shlex	2.0.1	crates-io	host
+socket2	0.6.5	crates-io	target
+spki	0.7.3	crates-io	target
+subtle	2.6.1	crates-io	target
+tokio	1.54.1	crates-io	target
+tracing	0.1.44	crates-io	target
+tracing-core	0.1.36	crates-io	target
+typenum	1.20.1	crates-io	target
+untrusted	0.9.0	crates-io	target
+version_check	0.9.5	crates-io	host
+zeroize	1.9.1	crates-io	target
+zk-driver	workspace	path	target
+zk-jute	workspace	path	target
+zk-proto	workspace	path	target

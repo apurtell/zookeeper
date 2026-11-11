@@ -1,0 +1,447 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The L1 layout probes: `cargo xtask layout gen` and
+//! `cargo xtask layout expect`.
+//!
+//! The probe is a C file that includes the installed headers as an
+//! application does. It puts the layout facts of the public types into
+//! constant arrays. `layout expect` compiles the probe and reads the arrays
+//! from the object file, so no probe code executes on the target.
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use crate::headers::{self, PubType};
+use crate::objfile;
+use crate::util::{self, Error};
+
+/// The columns of a `.expect` file.
+const COLUMNS: &str = "config\tfact\ttype\tmember\tvalue";
+
+/// One layout fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fact {
+    /// `sizeof`, `alignof`, `offsetof` or `signed`.
+    fact: &'static str,
+    /// The C type.
+    ty: String,
+    /// The member designator, or `-`.
+    member: String,
+}
+
+/// One probe array: the facts that share one condition.
+#[derive(Clone, Debug)]
+struct Group {
+    /// The C symbol of the array.
+    symbol: String,
+    /// The `#if` expression, or empty.
+    cond: String,
+    /// The facts in array order.
+    facts: Vec<Fact>,
+}
+
+/// Returns true when the condition applies to Windows only.
+fn windows_only(cond: &str) -> bool {
+    cond.split("&&").any(|p| {
+        let p = p.trim();
+        p == "WIN32" || p == "_WIN32"
+    })
+}
+
+/// Turns a normalized condition into an `#if` expression.
+fn if_expr(cond: &str) -> String {
+    let mut out = String::new();
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if !word.is_empty() {
+            if word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                out.push_str(word);
+            } else {
+                let _ = write!(out, "defined({word})");
+            }
+            word.clear();
+        }
+    };
+    for c in cond.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// Joins two conditions.
+fn and(a: &str, b: &str) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => b.to_owned(),
+        (_, true) => a.to_owned(),
+        _ if a == b => a.to_owned(),
+        _ => format!("{a} && {b}"),
+    }
+}
+
+/// Builds the probe groups from the public types.
+fn groups(types: &[PubType]) -> Vec<Group> {
+    let mut out: Vec<Group> = Vec::new();
+    let mut add = |cond: &str, f: Fact| {
+        if let Some(g) = out.iter_mut().find(|g| g.cond == cond) {
+            g.facts.push(f);
+        } else {
+            let symbol = format!("zk_layout_{}", out.len());
+            out.push(Group {
+                symbol,
+                cond: cond.to_owned(),
+                facts: vec![f],
+            });
+        }
+    };
+    for t in types {
+        if windows_only(&t.cond) {
+            continue;
+        }
+        let fact = |fact, member: &str| Fact {
+            fact,
+            ty: t.name.clone(),
+            member: member.to_owned(),
+        };
+        add(&t.cond, fact("sizeof", "-"));
+        add(&t.cond, fact("alignof", "-"));
+        if t.is_enum {
+            add(&t.cond, fact("signed", "-"));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for (m, c) in &t.members {
+            if windows_only(c) || seen.contains(&m.as_str()) {
+                continue;
+            }
+            seen.push(m);
+            add(&and(&t.cond, c), fact("offsetof", m));
+        }
+    }
+    out
+}
+
+/// Returns the C expression of a fact.
+fn expr(f: &Fact) -> String {
+    match f.fact {
+        "sizeof" => format!("sizeof({})", f.ty),
+        "alignof" => format!("_Alignof({})", f.ty),
+        "signed" => format!("(({})-1 < 0)", f.ty),
+        _ => format!("offsetof({}, {})", f.ty, f.member),
+    }
+}
+
+/// Renders `probe.c`.
+fn render_probe(gs: &[Group]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        util::comment_license(" *")
+            .replacen(" *", "/*\n *", 1)
+            .trim_end(),
+    );
+    s.push_str("\n */\n\n");
+    s.push_str(
+        "/*\n * L1 layout probe of the public types. Generated by `cargo xtask layout gen`.\n * Do not edit. The values are in constant arrays, so the probe needs no run.\n * Compile it as an application does: -I<prefix>/include and -I<prefix>/include/zookeeper,\n * and optionally -DHAVE_OPENSSL_H and -DHAVE_CYRUS_SASL_H.\n */\n\n",
+    );
+    s.push_str("#include <stddef.h>\n#include <zookeeper/zookeeper.h>\n#include <zookeeper/zookeeper_log.h>\n#include <zookeeper/recordio.h>\n#include <zookeeper/proto.h>\n\n");
+    for g in gs {
+        if !g.cond.is_empty() {
+            let _ = writeln!(s, "#if {}", if_expr(&g.cond));
+        }
+        let _ = writeln!(s, "const unsigned long long {}[] = {{", g.symbol);
+        for f in &g.facts {
+            let _ = writeln!(s, "    {},", expr(f));
+        }
+        s.push_str("};\n");
+        if !g.cond.is_empty() {
+            s.push_str("#endif\n");
+        }
+    }
+    s
+}
+
+/// Returns the probe text for the C client headers.
+fn probe(c_dir: &Path) -> Result<(String, Vec<Group>), Error> {
+    let gs = groups(&headers::public_types(c_dir)?);
+    Ok((render_probe(&gs), gs))
+}
+
+/// Compiles the probe and returns the value of each fact.
+fn measure(
+    cc: &str,
+    flags: &[String],
+    probe_c: &Path,
+    gs: &[Group],
+) -> Result<Vec<(Fact, u64)>, Error> {
+    let obj = probe_c.with_extension(format!("{}.o", flags.len()));
+    let out = std::process::Command::new(cc)
+        .args(flags)
+        .arg("-c")
+        .arg(probe_c)
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .map_err(|e| Error::msg(format!("{cc}: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::msg(format!(
+            "{cc} {} failed:\n{}",
+            flags.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let bytes = util::read_bytes(&obj)?;
+    let bin = objfile::parse(&bytes, None)?;
+    // ELF data 1 is little-endian; Mach-O here is always little-endian.
+    let le = !(bytes.starts_with(b"\x7fELF") && bytes.get(5) == Some(&2));
+    let mut vals = Vec::new();
+    for g in gs {
+        let Some(sym) = bin.symbols.get(&g.symbol) else {
+            continue;
+        };
+        let at = sym
+            .file_off
+            .and_then(|o| usize::try_from(o).ok())
+            .ok_or_else(|| Error::msg(format!("{}: no file contents", g.symbol)))?;
+        for (i, f) in g.facts.iter().enumerate() {
+            let start = i
+                .checked_mul(8)
+                .and_then(|o| o.checked_add(at))
+                .ok_or_else(|| Error::msg("probe offset overflow".to_owned()))?;
+            let raw = bytes
+                .get(start..start.saturating_add(8))
+                .ok_or_else(|| Error::msg(format!("{}: truncated", g.symbol)))?;
+            let mut a = [0_u8; 8];
+            a.copy_from_slice(raw);
+            vals.push((
+                f.clone(),
+                if le {
+                    u64::from_le_bytes(a)
+                } else {
+                    u64::from_be_bytes(a)
+                },
+            ));
+        }
+    }
+    Ok(vals)
+}
+
+/// Returns the default target name of the host.
+fn host_target() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        os => format!("{arch}-unknown-{os}"),
+    }
+}
+
+/// Renders the `.expect` file.
+fn render_expect(
+    target: &str,
+    plain: &[(Fact, u64)],
+    full: &[(Fact, u64)],
+    pin: &str,
+    full_flags: &str,
+) -> String {
+    let mut s = util::tsv_license();
+    let _ = writeln!(s, "# L1 layout facts of the public types for {target}.");
+    s.push_str("#\n");
+    s.push_str("# Generated by `cargo xtask layout expect` from tests/abi/layout/probe.c. The\n");
+    s.push_str("# values come from the compiled object; no probe code runs.\n");
+    s.push_str("# config plain: the headers without HAVE_OPENSSL_H and HAVE_CYRUS_SASL_H.\n");
+    let _ = writeln!(
+        s,
+        "# config tls-sasl: {full_flags}. It lists only the facts that are new or differ."
+    );
+    s.push_str("# fact: sizeof, alignof, offsetof (bytes) or signed (1 for a signed enum).\n");
+    let _ = writeln!(s, "# Headers at commit {pin}.");
+    let _ = writeln!(s, "{COLUMNS}");
+    for (f, v) in plain {
+        let _ = writeln!(s, "plain\t{}\t{}\t{}\t{v}", f.fact, f.ty, f.member);
+    }
+    for (f, v) in full {
+        if plain.iter().any(|(pf, pv)| pf == f && pv == v) {
+            continue;
+        }
+        let _ = writeln!(s, "tls-sasl\t{}\t{}\t{}\t{v}", f.fact, f.ty, f.member);
+    }
+    s
+}
+
+/// Runs `cargo xtask layout`.
+pub(crate) fn run(args: &[String]) -> Result<(), Error> {
+    let (cmd, rest) = args
+        .split_first()
+        .ok_or_else(|| Error::usage("layout: give gen or expect".to_owned()))?;
+    let mut c_dir = util::c_client_dir();
+    let mut include: Option<String> = None;
+    let mut cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let mut full_flags: Vec<String> = Vec::new();
+    let mut target = host_target();
+    let mut check_mode = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--c-dir" => c_dir = PathBuf::from(util::value(&mut it, a)?),
+            "--include" => include = Some(util::value(&mut it, a)?.to_owned()),
+            "--cc" => util::value(&mut it, a)?.clone_into(&mut cc),
+            "--full-cflags" => {
+                full_flags = util::value(&mut it, a)?
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect()
+            }
+            "--target" => util::value(&mut it, a)?.clone_into(&mut target),
+            "--check" => check_mode = true,
+            _ => return Err(Error::usage(format!("layout {cmd}: unknown argument {a}"))),
+        }
+    }
+    let o = LayoutOpts {
+        c_dir,
+        layout_dir: util::rust_c_dir().join("tests/abi/layout"),
+        include,
+        cc,
+        full_flags,
+        target,
+        check_mode,
+    };
+    match cmd.as_str() {
+        "gen" => generate(&o),
+        "expect" => expect(&o),
+        other => Err(Error::usage(format!(
+            "layout: unknown command {other}: use gen or expect"
+        ))),
+    }
+}
+
+/// The options of `cargo xtask layout`.
+struct LayoutOpts {
+    /// The legacy C tree. It gives the public headers and the commit pin.
+    c_dir: PathBuf,
+    /// The directory of the probe and the `.expect` files.
+    layout_dir: PathBuf,
+    include: Option<String>,
+    cc: String,
+    full_flags: Vec<String>,
+    target: String,
+    check_mode: bool,
+}
+
+/// Compares `text` with a file in check mode, or writes it.
+fn write_or_check(path: &Path, text: &str, check_mode: bool) -> Result<bool, Error> {
+    if check_mode {
+        if util::read(path)? == text {
+            Ok(false)
+        } else {
+            Err(Error::msg(format!(
+                "{} is out of date; run the task without --check",
+                util::rel(path)
+            )))
+        }
+    } else {
+        util::write(path, text)?;
+        Ok(true)
+    }
+}
+
+/// Runs `cargo xtask layout gen`.
+fn generate(o: &LayoutOpts) -> Result<(), Error> {
+    let (text, gs) = probe(&o.c_dir)?;
+    let path = o.layout_dir.join("probe.c");
+    if write_or_check(&path, &text, o.check_mode)? {
+        let n: usize = gs.iter().map(|g| g.facts.len()).sum();
+        util::out(&format!(
+            "layout gen: wrote {n} facts in {} arrays to {}\n",
+            gs.len(),
+            util::rel(&path)
+        ));
+    }
+    Ok(())
+}
+
+/// Runs `cargo xtask layout expect`.
+fn expect(o: &LayoutOpts) -> Result<(), Error> {
+    let include = o.include.as_ref().ok_or_else(|| {
+        Error::usage("layout expect: --include <prefix>/include is required".to_owned())
+    })?;
+    let (text, gs) = probe(&o.c_dir)?;
+    let tmp = std::env::temp_dir().join(format!("zk-layout-{}", std::process::id()));
+    let tmp_probe = tmp.join("probe.c");
+    util::write(&tmp_probe, &text)?;
+    // zookeeper_log.h includes <zookeeper.h>, so the probe also needs the
+    // header directory itself, as the legacy build does.
+    let base = vec![format!("-I{include}"), format!("-I{include}/zookeeper")];
+    let plain = measure(&o.cc, &base, &tmp_probe, &gs);
+    let mut ff = base.clone();
+    ff.extend([
+        "-DHAVE_OPENSSL_H".to_owned(),
+        "-DHAVE_CYRUS_SASL_H".to_owned(),
+    ]);
+    ff.extend(o.full_flags.iter().cloned());
+    let full = measure(&o.cc, &ff, &tmp_probe, &gs);
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (plain, full) = (plain?, full?);
+    let shown: Vec<&str> = ff.iter().skip(base.len()).map(String::as_str).collect();
+    let out = render_expect(
+        &o.target,
+        &plain,
+        &full,
+        &util::git_head(&o.c_dir),
+        &shown.join(" "),
+    );
+    let path = o.layout_dir.join(format!("{}.expect", o.target));
+    if write_or_check(&path, &out, o.check_mode)? {
+        util::out(&format!(
+            "layout expect: wrote {} plain facts to {}\n",
+            plain.len(),
+            util::rel(&path)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conditions() {
+        assert_eq!(
+            if_expr("HAVE_OPENSSL_H && !WIN32"),
+            "defined(HAVE_OPENSSL_H) && !defined(WIN32)"
+        );
+        assert!(windows_only("WIN32") && windows_only("A && _WIN32") && !windows_only("!WIN32"));
+        let t = PubType {
+            name: "zsock_t".to_owned(),
+            is_enum: false,
+            cond: String::new(),
+            members: vec![
+                ("sock".to_owned(), "WIN32".to_owned()),
+                ("sock".to_owned(), "!WIN32".to_owned()),
+                ("ssl_sock".to_owned(), "HAVE_OPENSSL_H".to_owned()),
+            ],
+        };
+        let g = groups(&[t]);
+        assert_eq!(g.len(), 3);
+        assert_eq!(g.get(1).map(|g| g.cond.as_str()), Some("!WIN32"));
+        assert!(render_probe(&g).contains("#if defined(HAVE_OPENSSL_H)\nconst unsigned long long zk_layout_2[] = {\n    offsetof(zsock_t, ssl_sock),\n};"));
+    }
+}

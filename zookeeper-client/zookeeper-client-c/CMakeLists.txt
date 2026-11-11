@@ -166,6 +166,12 @@ check_struct_has_member("struct sockaddr_in6" sin6_addr "netinet/in.h" ZOO_IPV6_
 # configure
 configure_file(cmake_config.h.in ${CMAKE_CURRENT_BINARY_DIR}/include/config.h)
 
+# WITH_RUST_CLIENT=ON builds the Rust client core of ../zookeeper-client-rust instead.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../zookeeper-client-rust/c/cmake/ZkRustClient.cmake)
+if(ZKRS_CORE)
+  return()
+endif()
+
 # hashtable library
 set(hashtable_sources src/hashtable/hashtable_itr.c src/hashtable/hashtable.c)
 add_library(hashtable STATIC ${hashtable_sources})
@@ -291,3 +297,5 @@ if(WANT_CPPUNIT)
     "ZKROOT=${CMAKE_CURRENT_SOURCE_DIR}/../.."
     "CLASSPATH=$CLASSPATH:$CLOVER_HOME/lib/clover*.jar")
 endif()
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/../zookeeper-client-rust/c/cmake/ZkRustPublicTests.cmake OPTIONAL)

@@ -1,0 +1,117 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The scripted cli_st session (spec line 1406). run-cli-session.sh feeds
+# this script to cli_st and compares the normalized output of the two
+# cores.
+#
+# Rule: in st, cli_st drives the handle with zookeeper_interest and
+# zookeeper_process, and every completion and watcher runs on the cli
+# thread inside zookeeper_process (spec lines 384-393, 584-589).
+# The output order is the dispatch order, so a diff of the transcripts
+# finds a change in that order.
+#
+# The directives:
+#   > LINE      Send LINE to the standard input of cli_st. Lines that
+#               follow each other without a wait go out back to back.
+#   ? ERE       Wait for a new line on the standard error of cli_st that
+#               matches ERE. A new line comes after the first send of the
+#               current group.
+#   ?N ERE      Wait for N such lines.
+#   ! LINE      Run a second client (the same cli_st, batch mode
+#               "cmd:LINE") to its end. This starts a new group. The
+#               output of the second client is a separate stream.
+# Each wait has a time limit (run-cli-session.sh --wait).
+#
+# Ledger: DSP-02, DSP-17
+
+# The session event comes from zookeeper_process.
+? ^Got a new session id
+
+# Asynchronous create in the persistent, ephemeral and sequential modes.
+> create /clis
+? ^\[/clis\]: rc = 0
+> create +e /clis/eph
+? ^\[/clis/eph\]: rc = 0
+> create +s /clis/seq-
+? ^\[/clis/seq-\]: rc = 0
+
+# A get and an ls set a data watch and a child watch on /clis.
+> get /clis
+? ephemeralOwner
+> ls /clis
+?2 ^time =
+
+# The set fires the data watch. The server sends the event before the
+# reply. One FIFO keeps the arrival order, so the watcher runs before the
+# completion (DSP-02, DSP-17).
+> set /clis newdata
+? ^Watcher CHANGED_EVENT
+? ^/clis: rc = 0 Stat:
+? ephemeralOwner
+
+# ls2 returns the children and the stat.
+> ls2 /clis
+? ephemeralOwner
+
+# A new child fires the child watch.
+> create /clis/child
+? ^Watcher CHILD_EVENT
+? ^\[/clis/child\]: rc = 0
+
+# wexists on a missing node sets an exists watch, and a create fires it.
+> wexists /clis/later
+? ^/clis/later: rc = -101 Stat:
+> create /clis/later
+? ^Watcher CREATED_EVENT
+? ^\[/clis/later\]: rc = 0
+
+# exists sets a watch, and a delete fires it.
+> exists /clis/later
+? ^/clis/later: rc = 0 Stat:
+> delete /clis/later
+? ^Watcher DELETED_EVENT
+? ^/clis/later: rc = 0
+
+# Three requests in one write: the completions come in submit order
+# (flush after submit).
+> create /clis/p1
+> create /clis/p2
+> delete /clis/p1
+? ^\[/clis/p1\]: rc = 0
+? ^\[/clis/p2\]: rc = 0
+? ^/clis/p1: rc = 0
+
+# A watch that another client fires while cli_st waits in select.
+> get /clis/eph
+? ephemeralOwner
+! set /clis/eph other
+? ^Watcher CHANGED_EVENT state = CONNECTED_STATE for path /clis/eph
+
+# sync, a missing node, a delete of a node with children and a path error.
+> sync /clis
+? ^\[/clis\]: rc = 0
+> get /clis/missing
+? ^/clis/missing: rc = -101
+> delete /clis
+? ^/clis: rc = -111
+> get clis
+? ^Path must start with /
+
+# myid prints to standard output. quit closes the handle in st.
+> myid
+> quit
+? ^Quitting

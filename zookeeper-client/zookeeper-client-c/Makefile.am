@@ -33,6 +33,8 @@ endif
 pkginclude_HEADERS = include/zookeeper.h include/zookeeper_version.h include/zookeeper_log.h include/proto.h include/recordio.h generated/zookeeper.jute.h
 EXTRA_DIST=LICENSE
 
+# The legacy C core. --with-rust-client=yes builds the Rust client core of ../zookeeper-client-rust instead.
+if LEGACY_CLIENT
 HASHTABLE_SRC = src/hashtable/hashtable_itr.h src/hashtable/hashtable_itr.c \
     src/hashtable/hashtable_private.h src/hashtable/hashtable.h src/hashtable/hashtable.c
 
@@ -153,6 +155,7 @@ else
 endif
   zktest_mt_LDFLAGS = -shared $(SYMBOL_WRAPPERS_MT) $(SOLARIS_LIB_LDFLAGS)
 endif
+endif # LEGACY_CLIENT
 
 TESTS = $(check_PROGRAMS)
 
@@ -161,3 +164,5 @@ clean-local: clean-check
 
 clean-check:
 	$(RM) $(nodist_zktest_st_OBJECTS) $(nodist_zktest_mt_OBJECTS)
+
+include $(srcdir)/../zookeeper-client-rust/c/rust.am

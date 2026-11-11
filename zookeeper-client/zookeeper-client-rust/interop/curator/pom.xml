@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+The Curator interop test of the Rust recipes.
+
+This project is standalone. It has no parent, and the root pom does not
+list it. The JUnit test runs Apache Curator InterProcessMutex and
+LeaderLatch against the same paths as the Rust interop_peer example. The
+test starts the peer as a process and talks to it over stdin and stdout.
+
+README.md gives the peer protocol and the commands. Build the interop_peer
+example of apache-zookeeper-recipes first, then run this project with
+the properties zk.connect and rust.peer.bin. With no zk.connect, or with
+no peer binary, the tests skip.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.apache.zookeeper</groupId>
+  <artifactId>zookeeper-rust-recipes-interop</artifactId>
+  <version>3.10.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+  <name>Apache ZooKeeper - Rust recipes Curator interop</name>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>11</maven.compiler.release>
+    <curator.version>5.7.1</curator.version>
+    <!-- The ZooKeeper client that Curator 5.7.1 is built against. -->
+    <zookeeper.version>3.9.2</zookeeper.version>
+    <junit.version>5.12.2</junit.version>
+    <surefire.version>3.5.3</surefire.version>
+    <!-- The Rust peer. cargo builds it with the example target. -->
+    <rust.peer.bin>${project.basedir}/../../target/debug/examples/interop_peer</rust.peer.bin>
+    <!-- The server or the ensemble. Empty skips the tests. -->
+    <zk.connect></zk.connect>
+    <!-- The port of the proxy of the recovery test. 0 takes a free port. -->
+    <interop.proxy.port>0</interop.proxy.port>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.curator</groupId>
+      <artifactId>curator-recipes</artifactId>
+      <version>${curator.version}</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>org.apache.zookeeper</groupId>
+          <artifactId>zookeeper</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.zookeeper</groupId>
+      <artifactId>zookeeper</artifactId>
+      <version>${zookeeper.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>${surefire.version}</version>
+        <configuration>
+          <systemPropertyVariables>
+            <rust.peer.bin>${rust.peer.bin}</rust.peer.bin>
+            <zk.connect>${zk.connect}</zk.connect>
+            <interop.proxy.port>${interop.proxy.port}</interop.proxy.port>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

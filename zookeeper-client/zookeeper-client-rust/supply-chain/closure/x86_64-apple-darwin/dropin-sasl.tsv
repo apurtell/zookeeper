@@ -1,0 +1,34 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The resolved crates of one shipped build. `cargo xtask closure update`
+# writes this file, and `cargo xtask closure check` compares it.
+# Do not edit it.
+#
+# package: zk-ffi
+# features: --features sasl
+# target: x86_64-apple-darwin
+
+name	version	source	kind
+bitflags	2.13.2	crates-io	target
+errno	0.3.14	crates-io	target
+libc	0.2.191	crates-io	target
+rustix	1.1.6	crates-io	target
+zeroize	1.9.1	crates-io	target
+zk-driver	workspace	path	target
+zk-ffi	workspace	path	target
+zk-jute	workspace	path	target
+zk-proto	workspace	path	target

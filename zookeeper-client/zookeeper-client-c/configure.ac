@@ -184,6 +184,10 @@ else
 fi
 AM_CONDITIONAL([WANT_SASL],[test "x$with_sasl" != xno])
 
+dnl --with-rust-client selects the legacy core or the Rust client core of ../zookeeper-client-rust.
+m4_include([../zookeeper-client-rust/c/m4/zk_rust.m4])
+ZK_RUST_CLIENT
+
 # Checks for header files.
 AC_HEADER_STDC
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h netdb.h netinet/in.h stdlib.h string.h sys/socket.h sys/time.h unistd.h sys/utsname.h])

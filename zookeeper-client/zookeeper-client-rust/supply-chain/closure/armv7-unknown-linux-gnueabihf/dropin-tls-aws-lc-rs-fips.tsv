@@ -1,0 +1,86 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The resolved crates of one shipped build. `cargo xtask closure update`
+# writes this file, and `cargo xtask closure check` compares it.
+# Do not edit it.
+#
+# package: zk-ffi
+# features: --features tls-aws-lc-rs-fips
+# target: armv7-unknown-linux-gnueabihf
+
+name	version	source	kind
+aho-corasick	1.1.5	crates-io	host
+aws-lc-fips-sys	0.14.4	crates-io	target
+aws-lc-rs	1.19.0	crates-io	target
+aws-lc-sys	0.47.0	crates-io	target
+base64ct	1.8.3	crates-io	target
+bindgen	0.73.2	crates-io	host
+bitflags	2.13.2	crates-io	target
+block-buffer	0.10.4	crates-io	target
+cc	1.11.0	crates-io	host
+cexpr	0.6.0	crates-io	host
+cfg-if	1.0.5	crates-io	target
+clang-sys	1.9.1	crates-io	host
+cmake	0.1.58	crates-io	host
+const-oid	0.9.6	crates-io	target
+crypto-common	0.1.7	crates-io	target
+der	0.7.10	crates-io	target
+digest	0.10.7	crates-io	target
+dunce	1.0.5	crates-io	host
+errno	0.3.14	crates-io	target
+find-msvc-tools	0.1.15	crates-io	host
+fs_extra	1.3.0	crates-io	host
+generic-array	0.14.7	crates-io	target
+glob	0.3.4	crates-io	host
+jobserver	0.1.35	crates-io	host
+libc	0.2.191	crates-io	target
+libloading	0.8.9	crates-io	host
+linux-raw-sys	0.12.1	crates-io	target
+log	0.4.35	crates-io	host
+memchr	2.8.3	crates-io	host
+minimal-lexical	0.2.1	crates-io	host
+nom	7.1.3	crates-io	host
+once_cell	1.21.4	crates-io	target
+pem-rfc7468	0.7.0	crates-io	target
+pkcs5	0.7.1	crates-io	target
+pkcs8	0.10.2	crates-io	target
+pkg-config	0.3.34	crates-io	host
+prettyplease	0.3.0	crates-io	host
+proc-macro2	1.0.107	crates-io	host
+quote	1.0.47	crates-io	host
+regex	1.13.1	crates-io	host
+regex-automata	0.4.18	crates-io	host
+regex-syntax	0.8.11	crates-io	host
+rustc-hash	2.1.3	crates-io	host
+rustix	1.1.6	crates-io	target
+rustls	0.23.46	crates-io	target
+rustls-pki-types	1.15.1	crates-io	target
+rustls-webpki	0.103.16	crates-io	target
+sha2	0.10.9	crates-io	target
+shlex	2.0.1	crates-io	host
+spki	0.7.3	crates-io	target
+subtle	2.6.1	crates-io	target
+syn	3.0.9	crates-io	host
+typenum	1.20.1	crates-io	target
+unicode-ident	1.0.27	crates-io	host
+untrusted	0.9.0	crates-io	target
+version_check	0.9.5	crates-io	host
+zeroize	1.9.1	crates-io	target
+zk-driver	workspace	path	target
+zk-ffi	workspace	path	target
+zk-jute	workspace	path	target
+zk-proto	workspace	path	target
