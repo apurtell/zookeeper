@@ -37,6 +37,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustix::event::{PollFd, Timespec};
@@ -51,6 +52,7 @@ use zk_testkit::rng::SeededRng;
 use zk_testkit::tokens::CompletionId;
 use zk_testkit::tokens::{TestTokens, WatcherId};
 
+use crate::clock::TestClock;
 use crate::host::{Discarded, HostLeaves};
 use crate::net::poll::Poll;
 use crate::net::sock::TcpSock;
@@ -75,6 +77,7 @@ pub struct TestHost {
     permute_disabled: AtomicBool,
     resolves: AtomicUsize,
     reseeds: AtomicUsize,
+    slow_dns: Mutex<Option<(Arc<TestClock>, u64)>>,
 }
 
 impl TestHost {
@@ -88,7 +91,13 @@ impl TestHost {
             permute_disabled: AtomicBool::new(false),
             resolves: AtomicUsize::new(0),
             reseeds: AtomicUsize::new(0),
+            slow_dns: Mutex::new(None),
         }
+    }
+
+    /// Makes each resolve call move `clock` forward by `ms`, as a slow DNS lookup does.
+    pub fn set_slow_dns(&self, clock: Arc<TestClock>, ms: u64) {
+        *self.slow_dns.lock_owner() = Some((clock, ms));
     }
 
     /// Adjusts the maximum enabled log level threshold.
@@ -175,6 +184,9 @@ impl HostLeaves<TestTokens> for TestHost {
 
     fn resolve(&self, _proof: &Unlocked, host: usize, spec: &HostSpec) -> HostResolution {
         self.resolves.fetch_add(1, Ordering::Relaxed);
+        if let Some((clock, ms)) = &*self.slow_dns.lock_owner() {
+            clock.advance(*ms);
+        }
         let result = match self.addrs.lock_owner().get(spec.host_bytes()) {
             Some(a) => Ok(a.clone()),
             None => Err(ResolveError {

@@ -110,6 +110,7 @@
 //! via `Connection::handle_transmitted`. Once traffic returns to small packets, `WriteBursts`
 //! reclaims oversized buffer allocations and scrubs any sensitive credential remnants.
 
+use std::cell::Cell;
 use std::net::SocketAddr;
 
 use rustix::event::{PollFd, PollFlags};
@@ -847,6 +848,11 @@ pub struct IoCore {
     pub(crate) bg_start: Option<Job>,
     /// Low-level OS `errno` cached from the most recent socket failure, exposed to C callers.
     pub(crate) errno: Option<i32>,
+    /// True while a turn runs. `interest_step`, `process_step`, `resume` and a flush outside
+    /// these steps each run as one turn.
+    in_turn: bool,
+    /// Clock value of the current turn. A call that can block clears it.
+    turn_at: Cell<Option<Millis>>,
 }
 
 impl std::fmt::Debug for IoCore {
@@ -891,7 +897,49 @@ impl IoCore {
             dns_next: None,
             bg_start: None,
             errno: None,
+            in_turn: false,
+            turn_at: Cell::new(None),
         }
+    }
+
+    /// Returns the time for the protocol calls of the current turn.
+    ///
+    /// A turn does not block, except in DNS, connect and TLS setup calls. These calls clear the
+    /// value, so the next read gets a fresh time. Timers have millisecond resolution. Thus the
+    /// first read in a turn sets the value, and later reads in the same turn use it. Outside a
+    /// turn, each call reads the clock.
+    fn turn_now(&self, clock: &dyn Clock) -> Millis {
+        if !self.in_turn {
+            return clock.now();
+        }
+        if let Some(at) = self.turn_at.get() {
+            return at;
+        }
+        let at = clock.now();
+        self.turn_at.set(Some(at));
+        at
+    }
+
+    /// Discards the turn time after a call that can block, such as DNS or a connect.
+    fn turn_refresh(&self) {
+        self.turn_at.set(None);
+    }
+
+    /// Runs one turn entry point with a fresh turn time.
+    fn in_turn<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.in_turn_at(None, f)
+    }
+
+    /// Runs one turn entry point. A caller that read the clock just before gives that time as
+    /// `at`, so the turn does not read the clock again. Each entry starts a new turn, so no
+    /// earlier state can leave a stale time in it.
+    fn in_turn_at<R>(&mut self, at: Option<Millis>, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.in_turn = true;
+        self.turn_at.set(at);
+        let r = f(self);
+        self.in_turn = false;
+        self.turn_at.set(None);
+        r
     }
 
     /// Retrieves the active underlying socket descriptor, or `-1` if no socket is connected.
@@ -1093,6 +1141,16 @@ impl IoCore {
         ob: &mut Outbox<T>,
         out: &mut InterestOut,
     ) -> Progress {
+        self.in_turn(|io| io.interest_turn(cx, proof, ob, out))
+    }
+
+    fn interest_turn<T: Tokens>(
+        &mut self,
+        cx: &StepCtx<'_, T>,
+        proof: &mut Unlocked,
+        ob: &mut Outbox<T>,
+        out: &mut InterestOut,
+    ) -> Progress {
         if self.job.is_some() {
             return Progress::Wait;
         }
@@ -1149,6 +1207,16 @@ impl IoCore {
         events: PollEvents,
         ob: &mut Outbox<T>,
     ) -> Progress {
+        self.in_turn(|io| io.process_turn(cx, proof, events, ob))
+    }
+
+    fn process_turn<T: Tokens>(
+        &mut self,
+        cx: &StepCtx<'_, T>,
+        proof: &mut Unlocked,
+        events: PollEvents,
+        ob: &mut Outbox<T>,
+    ) -> Progress {
         if self.job.is_some() {
             return Progress::Wait;
         }
@@ -1176,6 +1244,16 @@ impl IoCore {
     /// [`Progress::More`] is returned again so the caller drains the newly generated items before
     /// the saved [`Cont`] branch executes.
     pub(crate) fn resume<T: Tokens>(
+        &mut self,
+        cx: &StepCtx<'_, T>,
+        proof: &mut Unlocked,
+        ob: &mut Outbox<T>,
+        out: &mut InterestOut,
+    ) -> Progress {
+        self.in_turn(|io| io.resume_turn(cx, proof, ob, out))
+    }
+
+    fn resume_turn<T: Tokens>(
         &mut self,
         cx: &StepCtx<'_, T>,
         proof: &mut Unlocked,
@@ -1322,6 +1400,29 @@ impl IoCore {
         cx: &StepCtx<'_, T>,
         proof: &mut Unlocked,
     ) -> bool {
+        // An interest turn flushes a queued ping inside its own turn.
+        if self.in_turn {
+            return self.flush_turn(cx, proof);
+        }
+        self.in_turn(|io| io.flush_turn(cx, proof))
+    }
+
+    /// Runs [`Self::flush_once`] at the time `now` that the caller read just before. A submit
+    /// thus reads the clock once for the request and its flush.
+    pub(crate) fn flush_once_at<T: Tokens>(
+        &mut self,
+        cx: &StepCtx<'_, T>,
+        proof: &mut Unlocked,
+        now: Millis,
+    ) -> bool {
+        // A flush inside a turn keeps the time of that turn.
+        if self.in_turn {
+            return self.flush_turn(cx, proof);
+        }
+        self.in_turn_at(Some(now), |io| io.flush_turn(cx, proof))
+    }
+
+    fn flush_turn<T: Tokens>(&mut self, cx: &StepCtx<'_, T>, proof: &mut Unlocked) -> bool {
         match &self.conn {
             Transport::Plain(_) => self.plain_flush(cx, proof, None).is_ok(),
             Transport::Tls(t) if !t.tls.is_handshaking() => {
@@ -1580,11 +1681,15 @@ impl IoCore {
         proof: &mut Unlocked,
         ob: &mut Outbox<T>,
     ) -> bool {
-        let now = cx.clock.now();
         let mut g = cx.core.lock(proof);
         if g.restore_requeued(ob) {
             return true;
         }
+        // Most turns have no SASL answer and no stopped stage. Those turns do not read the clock.
+        if g.sasl.is_none() && g.stopped.is_none() {
+            return self.settle(&mut g, cx, ob);
+        }
+        let now = self.turn_now(cx.clock);
         if let Some(answer) = g.sasl.take() {
             if let Some(conn) = g.conn.as_deref_mut() {
                 let rc = match answer {
@@ -1613,7 +1718,7 @@ impl IoCore {
         ob: &mut Outbox<T>,
         out: &mut InterestOut,
     ) -> Progress {
-        let now = cx.clock.now();
+        let now = self.turn_now(cx.clock);
         let barrier = {
             let mut g = cx.core.lock(proof);
             let Some(conn) = g.conn.as_deref_mut() else {
@@ -1671,7 +1776,9 @@ impl IoCore {
                     clock: cx.clock,
                     flavor: cx.flavor,
                 };
-                match run.run(&rcx, proof, ob) {
+                let end = run.run(&rcx, proof, ob);
+                self.turn_refresh();
+                match end {
                     ResolveEnd::More => {
                         self.cont = Cont::Interest;
                         return Progress::More;
@@ -1696,7 +1803,7 @@ impl IoCore {
             let action = match self.held.take() {
                 Some(a) => a,
                 None => {
-                    let now = cx.clock.now();
+                    let now = self.turn_now(cx.clock);
                     let (action, barrier) = {
                         let mut g = cx.core.lock(proof);
                         // Outstanding dynamic server list updates take precedence and run as
@@ -1728,7 +1835,9 @@ impl IoCore {
                     action
                 }
             };
-            match self.run_action(cx, proof, ob, action) {
+            let flow = self.run_action(cx, proof, ob, action);
+            self.turn_refresh();
+            match flow {
                 Flow::Continue => {}
                 Flow::Return(p) => return p,
             }
@@ -2120,7 +2229,7 @@ impl IoCore {
                 .is_some_and(Connection::interest_queued_ping);
             ping_failed = ping && !self.flush_once(cx, proof);
         }
-        let now = cx.clock.now();
+        let now = self.turn_now(cx.clock);
         let (outcome, suspended, gate, barrier) = {
             let mut g = cx.core.lock(proof);
             let Some(conn) = g.conn.as_deref_mut() else {
@@ -2246,7 +2355,7 @@ impl IoCore {
         events: PollEvents,
         ob: &mut Outbox<T>,
     ) -> Progress {
-        let now = cx.clock.now();
+        let now = self.turn_now(cx.clock);
         let (has, barrier) = {
             let mut g = cx.core.lock(proof);
             let Some(conn) = g.conn.as_deref_mut() else {
@@ -2676,7 +2785,7 @@ impl IoCore {
         let Transport::Plain(sock) = &self.conn else {
             return None;
         };
-        let now = cx.clock.now();
+        let now = self.turn_now(cx.clock);
         let mut g = cx.core.lock(proof);
         let conn = g.conn.as_deref_mut()?;
         if !gate_open(cx, conn.state()) || conn.read_hint() < want {
@@ -2855,7 +2964,7 @@ impl IoCore {
             if self.rx_input().is_empty() || self.rx_stalled {
                 return FrameEnd::Done;
             }
-            let now = cx.clock.now();
+            let now = self.turn_now(cx.clock);
             let mut g = cx.core.lock(proof);
             if let Some(end) = self.frame_gate(&mut g, cx, ob) {
                 return end;
@@ -2952,7 +3061,6 @@ impl IoCore {
         ob: &mut Outbox<T>,
     ) -> bool {
         loop {
-            let now = cx.clock.now();
             let mut g = cx.core.lock(proof);
             let Some(conn) = g.conn.as_deref_mut() else {
                 return false;
@@ -2978,6 +3086,7 @@ impl IoCore {
                         return true;
                     }
                     Err(which) => {
+                        let now = self.turn_now(cx.clock);
                         let rc = conn.handle_sasl_addr_failed(call.generation, which, now);
                         if rc != ZOK {
                             self.stop_rc.get_or_insert(rc);
@@ -3031,7 +3140,7 @@ impl IoCore {
                 return Ok(());
             }
             let n = self.plain_sent(n);
-            let now = cx.clock.now();
+            let now = self.turn_now(cx.clock);
             let mut g = cx.core.lock(proof);
             let Some(conn) = g.conn.as_deref_mut() else {
                 return Ok(());

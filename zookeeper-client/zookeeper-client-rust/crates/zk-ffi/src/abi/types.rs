@@ -367,8 +367,8 @@ pub const ZKRS_ARG_GAI_STR: u32 = 6;
 /// Thread-local outbox storage container allocated on the C stack during driver stepping.
 ///
 /// Encapsulates pending outbox events queued for emission during a single driver execution step.
-/// The `impl` pointer remains null until the Rust runtime enqueues the first item and is accessed
-/// exclusively by Rust.
+/// The `impl` pointer remains null until the Rust runtime enqueues the first item. C can test it
+/// for null to skip an empty drain. Only Rust reads through it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct zkrs_outbox {
