@@ -43,7 +43,9 @@
 //!    collects the full `Vec<HostResolution>` and reseeds the PRNG, [`apply_results`] ingests the
 //!    entire batch into `conn` in a single critical section.
 
-use zk_proto::{Connection, HostResolution, HostSpec, Tokens, rc};
+use std::sync::Arc;
+
+use zk_proto::{Connection, HostResolution, HostSpec, Millis, Tokens, rc};
 
 use crate::clock::Clock;
 use crate::host::HostLeaves;
@@ -82,7 +84,7 @@ pub(crate) struct ResolveRun {
     /// updates.
     pub(crate) generation: u64,
     /// Configured host specifications to resolve in order.
-    pub(crate) hosts: Vec<HostSpec>,
+    pub(crate) hosts: Arc<[HostSpec]>,
     /// Index of the next host entry awaiting DNS resolution.
     pub(crate) next: usize,
     /// Indicates whether at least one host entry resolved to a valid IP address.
@@ -93,6 +95,9 @@ pub(crate) struct ResolveRun {
     rc: i32,
     /// Whether this run should execute transport teardown upon completing a rebalance.
     teardown: bool,
+    /// Clock time after the last host lookup of the current `run` call. The commit and the caller
+    /// use it, so they do not read the clock again. Each `run` call clears it.
+    at: Option<Millis>,
 }
 
 /// Outcome of executing a step within a [`ResolveRun`].
@@ -109,7 +114,7 @@ pub(crate) enum ResolveEnd {
 
 impl ResolveRun {
     /// Initializes a new resolution run for the specified generation and host list.
-    pub(crate) fn new(generation: u64, hosts: Vec<HostSpec>) -> Self {
+    pub(crate) fn new(generation: u64, hosts: Arc<[HostSpec]>) -> Self {
         Self {
             generation,
             hosts,
@@ -118,11 +123,20 @@ impl ResolveRun {
             phase: ResolvePhase::Hosts,
             rc: rc::ZOK,
             teardown: true,
+            at: None,
         }
     }
 
+    /// Returns the clock time after the last host lookup of the latest `run` call.
+    ///
+    /// The value is `None` if that call did no lookup and did not commit. Only the short reseed
+    /// follows this time inside the run, so the caller can use it as its current time.
+    pub(crate) fn last_at(&self) -> Option<Millis> {
+        self.at
+    }
+
     /// Initializes a resolution run that delegates forced close teardown to the outer I/O driver.
-    pub(crate) fn without_teardown(generation: u64, hosts: Vec<HostSpec>) -> Self {
+    pub(crate) fn without_teardown(generation: u64, hosts: Arc<[HostSpec]>) -> Self {
         Self {
             teardown: false,
             ..Self::new(generation, hosts)
@@ -137,6 +151,9 @@ impl ResolveRun {
         proof: &mut Unlocked,
         ob: &mut Outbox<T>,
     ) -> ResolveEnd {
+        // A time from an earlier call can be stale, because the caller drains the outbox between
+        // calls.
+        self.at = None;
         if let ResolveEnd::More = self.run_hosts(cx, proof, ob) {
             return ResolveEnd::More;
         }
@@ -149,8 +166,12 @@ impl ResolveRun {
                 cx.host.rng_reseed(proof);
             }
             // Reseed and commitment execute within an unbroken transition to prevent duplicate
-            // reseeding.
-            let now = cx.clock.now();
+            // reseeding. The reseed is short, so the time after the last lookup stays current.
+            let now = match self.at {
+                Some(at) => at,
+                None => cx.clock.now(),
+            };
+            self.at = Some(now);
             let mut core = cx.core.lock(proof);
             self.rc = match core.conn.as_deref_mut() {
                 Some(conn) => {
@@ -200,6 +221,7 @@ impl ResolveRun {
             // barrier resume.
             self.next = self.next.saturating_add(1);
             let now = cx.clock.now();
+            self.at = Some(now);
             let mut core = cx.core.lock(proof);
             let Some(conn) = core.conn.as_deref_mut() else {
                 self.phase = ResolvePhase::Done;
@@ -264,7 +286,8 @@ impl SetServersRun {
             };
         };
         let had_transport = conn.has_transport();
-        let generation = conn.set_servers(specs.clone(), now);
+        let specs: Arc<[HostSpec]> = specs.into();
+        let generation = conn.set_servers_shared(Arc::clone(&specs), now);
         let run = Self {
             id,
             run: ResolveRun::without_teardown(generation, specs),

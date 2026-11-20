@@ -135,18 +135,27 @@ impl HostLeaves<CTokens> for FfiHost {
 
     /// Blocking hook: performs hostname and service port resolution via `getaddrinfo`.
     ///
-    /// Converts `spec.host` and `spec.service` into null-terminated buffers in [`CText`] and
-    /// delegates to [`raw::vt_resolve`]. Maps C error codes `(errno, gai_rc)` into `ResolveError`
-    /// and records skipped address families in `HostResolution`.
+    /// Writes `spec.host` and `spec.service` as null-terminated texts into stack buffers and
+    /// delegates to [`raw::vt_resolve`]. The buffers belong to this frame, so the texts do not move
+    /// after they are written. Maps C error codes `(errno, gai_rc)` into `ResolveError` and records
+    /// skipped address families in `HostResolution`.
     fn resolve(&self, proof: &Unlocked, host: usize, spec: &HostSpec) -> HostResolution {
-        let (name, port) = resolve_args(spec);
+        let mut name_buf = [0u8; HOST_INLINE];
+        let mut service_buf = [0u8; SERVICE_INLINE];
+        let mut name_heap = None;
+        let mut service_heap = None;
+        let mut digits = [0u8; PORT_DIGITS];
+        let (name, service) = match spec {
+            HostSpec::Legacy(h) => (h.host.as_slice(), h.service.as_slice()),
+            HostSpec::Native(h) => (h.host.as_bytes(), port_text(h.port, &mut digits)),
+        };
         let mut out = raw::HostAddrs::default();
-        // Because `CText` guarantees terminating NUL bytes, string conversion succeeds reliably.
+        // Because `c_text` always writes a terminating NUL byte, string conversion succeeds.
         let (errno, gai_rc) = match (
-            CStr::from_bytes_until_nul(name.as_bytes()),
-            CStr::from_bytes_until_nul(port.as_bytes()),
+            c_text(&mut name_buf, &mut name_heap, name),
+            c_text(&mut service_buf, &mut service_heap, service),
         ) {
-            (Ok(n), Ok(p)) => raw::vt_resolve(&self.vt, proof, n, p, &mut out),
+            (Some(n), Some(p)) => raw::vt_resolve(&self.vt, proof, n, p, &mut out),
             _ => (libc::EINVAL, 0),
         };
         let raw::HostAddrs {
@@ -171,73 +180,49 @@ impl HostLeaves<CTokens> for FfiHost {
     }
 }
 
-/// Inline byte buffer capacity for [`CText`]. Because standard DNS hostnames do not exceed 253
-/// octets, typical host and port strings are marshaled on the stack without heap allocation.
-const CTEXT_INLINE: usize = 256;
+/// Stack buffer capacity for a host name. DNS host names do not exceed 253 octets, so typical
+/// host names do not need a heap allocation.
+const HOST_INLINE: usize = 256;
 
-/// Stack-allocated, null-terminated string buffer with heap fallback for foreign C string
-/// parameters.
-struct CText {
-    inline: [u8; CTEXT_INLINE],
-    len: usize,
-    heap: Option<Box<[u8]>>,
-}
+/// Stack buffer capacity for a service name or a port number text.
+const SERVICE_INLINE: usize = 32;
 
-impl CText {
-    /// Copies the byte slice into an inline buffer or heap allocation, appending a terminating NUL
-    /// byte.
-    fn copy(b: &[u8]) -> Self {
-        let mut t = Self {
-            inline: [0u8; CTEXT_INLINE],
-            len: 0,
-            heap: None,
-        };
-        match t.inline.get_mut(..b.len()) {
-            Some(dst) if b.len() < CTEXT_INLINE => {
-                dst.copy_from_slice(b);
-                t.len = b.len().saturating_add(1);
-            }
-            _ => t.heap = Some(raw::c_bytes(b)),
-        }
-        t
-    }
+/// Number of decimal digits in the largest port number.
+const PORT_DIGITS: usize = 5;
 
-    /// Formats an unsigned 16-bit integer port number as null-terminated decimal ASCII text.
-    fn port(port: u16) -> Self {
-        let mut digits = [0u8; 5];
-        let mut at = digits.len();
-        let mut v = port;
-        while at > 0 {
-            at = at.saturating_sub(1);
-            if let Some(d) = digits.get_mut(at) {
-                *d = b'0'.saturating_add(u8::try_from(v % 10).unwrap_or(0));
-            }
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        Self::copy(digits.get(at..).unwrap_or(&[]))
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        match &self.heap {
-            Some(b) => b,
-            None => self.inline.get(..self.len).unwrap_or(&[]),
-        }
-    }
-}
-
-/// Formats hostname and port specifications as null-terminated C string buffers for address
-/// resolution.
+/// Writes `b` and a terminating NUL byte into `buf` and returns the result as a C string.
 ///
-/// Preserves verbatim string representations for legacy specs to match original C client resolution
-/// semantics; formats numeric port numbers as decimal text for native specifications.
-fn resolve_args(spec: &HostSpec) -> (CText, CText) {
-    match spec {
-        HostSpec::Legacy(h) => (CText::copy(&h.host), CText::copy(&h.service)),
-        HostSpec::Native(h) => (CText::copy(h.host.as_bytes()), CText::port(h.port)),
+/// If `buf` is too small, the text goes into a new allocation in `heap`. The result stops at the
+/// first NUL byte, as a C caller reads it.
+fn c_text<'a>(buf: &'a mut [u8], heap: &'a mut Option<Box<[u8]>>, b: &[u8]) -> Option<&'a CStr> {
+    let text: &[u8] = match buf.get_mut(..=b.len()) {
+        Some(dst) => {
+            if let Some((nul, body)) = dst.split_last_mut() {
+                body.copy_from_slice(b);
+                *nul = 0;
+            }
+            dst
+        }
+        None => heap.insert(raw::c_bytes(b)),
+    };
+    CStr::from_bytes_until_nul(text).ok()
+}
+
+/// Formats a port number as decimal ASCII text in `digits` and returns the used digits.
+fn port_text(port: u16, digits: &mut [u8; PORT_DIGITS]) -> &[u8] {
+    let mut at = digits.len();
+    let mut v = port;
+    while at > 0 {
+        at = at.saturating_sub(1);
+        if let Some(d) = digits.get_mut(at) {
+            *d = b'0'.saturating_add(u8::try_from(v % 10).unwrap_or(0));
+        }
+        v /= 10;
+        if v == 0 {
+            break;
+        }
     }
+    digits.get(at..).unwrap_or(&[])
 }
 
 #[cfg(test)]
@@ -347,20 +332,43 @@ mod tests {
         assert!(h.is_zero());
     }
 
+    fn text(len: usize, fill: &[u8]) -> (Vec<u8>, bool) {
+        let mut buf = [0u8; HOST_INLINE];
+        let mut heap = None;
+        let b: Vec<u8> = fill.iter().copied().cycle().take(len).collect();
+        let got = c_text(&mut buf, &mut heap, &b).map(|c| c.to_bytes_with_nul().to_vec());
+        (got.unwrap_or_default(), heap.is_some())
+    }
+
     #[test]
-    fn ctext_ends_short_and_long_texts_with_a_nul() {
-        assert_eq!(CText::copy(b"zk1").as_bytes(), b"zk1\0");
-        assert_eq!(CText::copy(b"").as_bytes(), b"\0");
-        let long = vec![b'a'; CTEXT_INLINE];
-        let mut want = long.clone();
+    fn c_text_ends_short_and_long_texts_with_a_nul() {
+        assert_eq!(text(3, b"zk1"), (b"zk1\0".to_vec(), false));
+        assert_eq!(text(0, b"x"), (b"\0".to_vec(), false));
+        let mut want = vec![b'a'; HOST_INLINE];
         want.push(0);
-        assert!(CText::copy(&long).heap.is_some());
-        assert_eq!(CText::copy(&long).as_bytes(), &want[..]);
-        let fits = vec![b'b'; CTEXT_INLINE - 1];
-        assert!(CText::copy(&fits).heap.is_none());
-        assert_eq!(CText::copy(&fits).as_bytes().len(), CTEXT_INLINE);
-        assert_eq!(CText::port(0).as_bytes(), b"0\0");
-        assert_eq!(CText::port(7).as_bytes(), b"7\0");
-        assert_eq!(CText::port(65535).as_bytes(), b"65535\0");
+        assert_eq!(text(HOST_INLINE, b"a"), (want, true));
+        let mut want = vec![b'b'; HOST_INLINE - 1];
+        want.push(0);
+        assert_eq!(text(HOST_INLINE - 1, b"b"), (want, false));
+        // A C caller reads the text only up to the first NUL byte.
+        assert_eq!(text(3, b"a\0b"), (b"a\0".to_vec(), false));
+    }
+
+    #[test]
+    fn port_text_gives_the_decimal_digits() {
+        let mut d = [0u8; PORT_DIGITS];
+        assert_eq!(port_text(0, &mut d), b"0");
+        assert_eq!(port_text(7, &mut d), b"7");
+        assert_eq!(port_text(2181, &mut d), b"2181");
+        assert_eq!(port_text(65535, &mut d), b"65535");
+    }
+
+    #[test]
+    fn resolve_passes_a_long_legacy_service_from_the_heap() {
+        let _rec = standin::recorder();
+        let h = FfiHost::new(standin::vtable(), 0x55);
+        let service = vec![b's'; SERVICE_INLINE + 3];
+        let _ = h.resolve(&Unlocked::new_at_entry(), 0, &legacy(b"zk3", &service));
+        assert_eq!(standin::resolved(), vec![(b"zk3".to_vec(), service)]);
     }
 }

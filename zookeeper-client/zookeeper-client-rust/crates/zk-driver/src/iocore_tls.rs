@@ -471,7 +471,8 @@ pub(crate) fn tls_frames<T: Tokens>(
         }
     };
     match io.frame_loop(cx, proof, ob) {
-        FrameEnd::More => {
+        // TLS can hold more plaintext in the session, so a hold always resumes in this turn.
+        FrameEnd::More | FrameEnd::ReplyHold => {
             io.cont = Cont::TlsFrames { handshake };
             return Progress::More;
         }
