@@ -109,6 +109,96 @@ const CLOEXEC_FLAG: Option<SocketFlags> = Some(SocketFlags::CLOEXEC);
 ))]
 const CLOEXEC_FLAG: Option<SocketFlags> = None;
 
+/// Largest TCP segment, in bytes, on a Linux loopback path: an MTU of 65536 less the IPv4 and
+/// TCP headers.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const LOOPBACK_SEGMENT_BYTES: usize = 65496;
+
+/// Smallest `TCP_MAXSEG` value that Linux accepts.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MIN_SEGMENT_OPTION: usize = 88;
+
+/// Largest `TCP_MAXSEG` value that Linux accepts.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAX_SEGMENT_OPTION: usize = 32_767;
+
+/// Returns the segment limit for a loopback socket with a receive buffer of `rcvbuf` bytes.
+///
+/// Linux offers only a part of the receive buffer as the window. The remaining part pays for
+/// the buffer overhead. On loopback, the window is about half of the buffer or more. Linux
+/// sends a window update only when the free window can at least double. If one peer segment
+/// is larger than half of the full window, the free window can stay below one segment. Then no
+/// update occurs, and the peer waits for its persist timer, about 200 ms.
+///
+/// The limit is one sixth of the buffer. Thus the stall cannot occur while the window is at
+/// least one third of the buffer. The result is `None` when no loopback segment is larger than
+/// one sixth of the buffer.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn loopback_segment_limit(rcvbuf: usize) -> Option<u32> {
+    let limit = rcvbuf / 6;
+    if limit >= LOOPBACK_SEGMENT_BYTES {
+        return None;
+    }
+    // Linux refuses a value outside its range. A value below one sixth of the buffer only
+    // increases the margin.
+    u32::try_from(limit.clamp(MIN_SEGMENT_OPTION, MAX_SEGMENT_OPTION)).ok()
+}
+
+/// Limits the peer segment size of a loopback socket before it connects.
+///
+/// The limit comes from the receive buffer of the new socket. The peer learns the limit from
+/// the handshake, so the limit must be set before the connect. The limit also applies to the
+/// segments that this socket sends. The limit affects only performance, so the function
+/// ignores failures.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn limit_loopback_segments(fd: &OwnedFd) {
+    let Ok(rcvbuf) = rustix::net::sockopt::socket_recv_buffer_size(fd) else {
+        return;
+    };
+    if let Some(mss) = loopback_segment_limit(rcvbuf) {
+        let _ignored = socket2::SockRef::from(fd).set_tcp_mss(mss);
+    }
+}
+
+/// Tells if a connection to `addr` goes through the loopback device.
+///
+/// A loopback or unspecified address always does, and the check needs no system call. Linux
+/// also routes each address of this host through the loopback device. For such an address,
+/// Linux selects the address itself as the source. A UDP socket that connects to `addr` shows
+/// that source, and it sends no packet. For each other address, the check thus costs four
+/// system calls once for each connect attempt. A failure of the check gives `false`, so the
+/// socket keeps the kernel default. A wrong `true` result is safe, because the limit only makes
+/// segments smaller.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn uses_loopback_device(addr: &SocketAddr) -> bool {
+    let ip = addr.ip().to_canonical();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    // A mapped IPv4 address uses an IPv4 socket. Another address keeps its scope.
+    let target = if ip == addr.ip() {
+        *addr
+    } else {
+        SocketAddr::new(ip, addr.port())
+    };
+    let family = if target.is_ipv4() {
+        AddressFamily::INET
+    } else {
+        AddressFamily::INET6
+    };
+    let Ok(udp) = rustix::net::socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
+    else {
+        return false;
+    };
+    if rustix::net::connect(&udp, &target).is_err() {
+        return false;
+    }
+    rustix::net::getsockname(&udp)
+        .ok()
+        .and_then(|any| SocketAddr::try_from(any).ok())
+        .is_some_and(|local| local.ip().to_canonical() == ip)
+}
+
 /// Configures the provided file descriptor for non-blocking I/O via `fcntl(F_SETFL, O_NONBLOCK)`.
 ///
 /// Modifies the descriptor status flags while preserving existing flags.
@@ -130,6 +220,10 @@ impl TcpSock {
     /// - `SO_NOSIGPIPE` on Apple targets to prevent process termination on broken pipes.
     /// - `TCP_NODELAY` to minimize request latency; failures to set nodelay are recorded
     ///   in `nodelay_ok` rather than aborting socket creation.
+    /// - On Linux, for a path through the loopback device only, a `TCP_MAXSEG` limit that comes
+    ///   from the receive buffer. Such a path has a loopback address or an address of this host.
+    ///   The limit prevents a stall of the peer while it waits for a window update. A failure to
+    ///   set the limit is ignored.
     ///
     /// # Errors
     ///
@@ -164,6 +258,14 @@ impl TcpSock {
         // Emulate C client behavior: log TCP_NODELAY failures as warnings rather than failing the
         // connection.
         let nodelay_ok = rustix::net::sockopt::set_tcp_nodelay(&fd, true).is_ok();
+        // On loopback, one peer segment can be half of the receive buffer. A fast reader keeps
+        // the buffer small, so the free window can stay below one segment with no window
+        // update. An address of this host also uses the loopback device. Other paths have much
+        // smaller segments, so they keep the kernel default.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if uses_loopback_device(addr) {
+            limit_loopback_segments(&fd);
+        }
         Ok(Opened {
             sock: Self { fd },
             nodelay_ok,
@@ -276,4 +378,57 @@ impl AsFd for TcpSock {
 #[must_use]
 pub fn errno_value(e: Errno) -> i32 {
     e.raw_os_error()
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::net::{SocketAddr, UdpSocket};
+
+    use super::{loopback_segment_limit, uses_loopback_device};
+
+    /// Tells if a connection to the address `s` goes through the loopback device.
+    fn local(s: &str) -> bool {
+        uses_loopback_device(&s.parse().unwrap())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no UDP sockets")]
+    fn only_addresses_of_this_host_use_the_loopback_device() {
+        assert!(local("127.0.0.1:9"));
+        assert!(local("127.1.2.3:9"));
+        assert!(local("0.0.0.0:9"));
+        assert!(local("[::1]:9"));
+        assert!(local("[::ffff:127.0.0.1]:9"));
+        // 192.0.2.1 is a documentation address, so it is not an address of this host.
+        assert!(!local("192.0.2.1:9"));
+        // The source address of the route to 192.0.2.1 is an address of this host.
+        let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
+        if udp.connect("192.0.2.1:9").is_ok() {
+            let own = udp.local_addr().unwrap().ip();
+            assert!(uses_loopback_device(&SocketAddr::new(own, 9)), "{own}");
+        }
+    }
+
+    #[test]
+    fn the_segment_limit_is_a_sixth_of_the_receive_buffer() {
+        assert_eq!(loopback_segment_limit(131_072), Some(21_845));
+        assert_eq!(loopback_segment_limit(160_000), Some(26_666));
+        assert_eq!(loopback_segment_limit(4_096), Some(682));
+    }
+
+    #[test]
+    fn the_segment_limit_stays_in_the_accepted_range() {
+        assert_eq!(loopback_segment_limit(0), Some(88));
+        assert_eq!(loopback_segment_limit(196_601), Some(32_766));
+        assert_eq!(loopback_segment_limit(196_602), Some(32_767));
+        assert_eq!(loopback_segment_limit(392_975), Some(32_767));
+    }
+
+    #[test]
+    fn a_large_receive_buffer_needs_no_limit() {
+        assert_eq!(loopback_segment_limit(392_976), None);
+        assert_eq!(loopback_segment_limit(usize::MAX), None);
+    }
 }
